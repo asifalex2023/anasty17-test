@@ -1,77 +1,80 @@
-from time import sleep
+from asyncio import sleep, TimeoutError
+from aiohttp.client_exceptions import ClientError
 
-from bot import LOGGER, aria2
-from bot.helper.ext_utils.bot_utils import async_to_sync, sync_to_async
+from ... import LOGGER
+from ...core.torrent_manager import TorrentManager, aria2_name
 
 
 class DirectListener:
-    def __init__(self, foldername, total_size, path, listener, a2c_opt):
-        self.name = foldername
-        self.total_size = total_size
-        self.__path = path
-        self.__listener = listener
-        self.__download = None
-        self.is_downloading = False
-        self.__a2c_opt = a2c_opt
-        self.proc_bytes = 0
-        self.file_processed_bytes = 0
-        self.failed = 0
+    def __init__(self, path, listener, a2c_opt):
+        self.listener = listener
+        self._path = path
+        self._a2c_opt = a2c_opt
+        self._proc_bytes = 0
+        self._failed = 0
+        self.download_task = None
+        self.name = self.listener.name
 
     @property
     def processed_bytes(self):
-        if self.__download:
-            return self.file_processed_bytes + self.__download.completed_length
-        return self.file_processed_bytes
+        if self.download_task:
+            return self._proc_bytes + int(self.download_task.get("completedLength", "0"))
+        return self._proc_bytes
 
     @property
     def speed(self):
-        return self.__download.download_speed if self.__download else 0
+        return int(self.download_task.get("downloadSpeed", "0")) if self.download_task else 0
 
-    def download(self, contents):
+    async def download(self, contents):
         self.is_downloading = True
         for content in contents:
-            if not self.is_downloading:
+            if self.listener.is_cancelled:
                 break
-            if content['path']:
-                self.__a2c_opt['dir'] = f"{self.__path}/{content['path']}"
+            if content["path"]:
+                self._a2c_opt["dir"] = f"{self._path}/{content['path']}"
             else:
-                self.__a2c_opt['dir'] = self.__path
-            filename = content['filename']
-            self.__a2c_opt['out'] = filename
+                self._a2c_opt["dir"] = self._path
+            filename = content["filename"]
+            self._a2c_opt["out"] = filename
             try:
-                self.__download = aria2.add_uris([content['url']], self.__a2c_opt)
-            except Exception as e:
-                self.failed += 1
-                LOGGER.error(f'Unable to download {filename} due to: {e}')
+                gid = await TorrentManager.aria2.addUri(
+                    uris=[content["url"]], options=self._a2c_opt, position=0
+                )
+            except (TimeoutError, ClientError) as e:
+                self._failed += 1
+                LOGGER.error(f"Unable to download {filename} due to: {e}")
                 continue
-            self.__download = self.__download.live
+            self.download_task = await TorrentManager.aria2.tellStatus(gid)
             while True:
-                if not self.is_downloading:
-                    if self.__download:
-                        self.__download.remove(True, True)
+                if self.listener.is_cancelled:
+                    if self.download_task:
+                        await TorrentManager.aria2_remove(self.download_task)
                     break
-                self.__download = self.__download.live
-                if error_message:= self.__download.error_message:
-                    self.failed += 1
-                    LOGGER.error(f'Unable to download {self.__download.name} due to: {error_message}')
-                    self.__download.remove(True, True)
+                self.download_task = await TorrentManager.aria2.tellStatus(gid)
+                if error_message := self.download_task.get("errorMessage"):
+                    self._failed += 1
+                    LOGGER.error(
+                        f"Unable to download {aria2_name(self.download_task)} due to: {error_message}"
+                    )
+                    await TorrentManager.aria2_remove(self.download_task)
                     break
-                elif self.__download.is_complete:
-                    self.file_processed_bytes += self.__download.completed_length
-                    self.__download.remove(True)
+                elif self.download_task.get("status", "") == "complete":
+                    self._proc_bytes += int(self.download_task.get("totalLength", "0"))
+                    await TorrentManager.aria2_remove(self.download_task)
                     break
-                sleep(1)
-            self.__download = None
-        if not self.is_downloading:
+                await sleep(1)
+            self.download_task = None
+        if self.listener.is_cancelled:
             return
-        if self.failed == len(contents):
-            async_to_sync(self.__listener.onDownloadError, 'All files are failed to download!')
+        if self._failed == len(contents):
+            await self.listener.on_download_error("All files are failed to download!")
             return
-        async_to_sync(self.__listener.onDownloadComplete)
+        await self.listener.on_download_complete()
+        return
 
-    async def cancel_download(self):
-        self.is_downloading = False
-        LOGGER.info(f"Cancelling Download: {self.name}")
-        await self.__listener.onDownloadError("Download Cancelled by User!")
-        if self.__download:
-            await sync_to_async(self.__download.remove, force=True, files=True)
+    async def cancel_task(self):
+        self.listener.is_cancelled = True
+        LOGGER.info(f"Cancelling Download: {self.listener.name}")
+        await self.listener.on_download_error("Download Cancelled by User!")
+        if self.download_task:
+            await TorrentManager.aria2_remove(self.download_task)
